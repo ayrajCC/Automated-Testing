@@ -1,0 +1,607 @@
+#!/usr/bin/env python3
+"""
+CXone Healthcare Automated Testing Framework
+
+This framework provides end-to-end testing capabilities for NICE CXone healthcare applications,
+integrating Selenium WebDriver with the CXone Agent SDK. It supports:
+- Agent UI workflow testing
+- Patient interaction simulation
+- Healthcare compliance validation
+- Cross-browser testing
+- Test result reporting with HIPAA-compliant logging
+
+Author: NICE CXone Software Engineer
+"""
+
+import os
+import sys
+import json
+import time
+import logging
+import argparse
+import datetime
+import unittest
+import requests
+import pandas as pd
+from typing import Dict, List, Any, Optional, Tuple
+from pathlib import Path
+
+# Selenium imports
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, WebDriverException
+
+# CXone Agent SDK imports
+import cxone_agent_sdk
+from cxone_agent_sdk.client import CXoneClient
+from cxone_agent_sdk.models import Contact, ContactAttribute, AgentState
+from cxone_agent_sdk.exceptions import CXoneApiException, AuthenticationException
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("cxone_healthcare_tests.log"),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+
+logger = logging.getLogger("CXoneHealthcareTests")
+
+
+class CXoneTestConfig:
+    """Configuration manager for CXone test framework"""
+    
+    def __init__(self, config_path: str):
+        """Initialize test configuration
+        
+        Args:
+            config_path: Path to configuration JSON file
+        """
+        self.config_path = config_path
+        self.config = self._load_config()
+        
+        # Set required configuration parameters
+        self.cxone_api_url = self.config.get('cxone_api_url', 'https://api.nice-incontact.com')
+        self.browser = self.config.get('browser', 'chrome')
+        self.headless = self.config.get('headless', True)
+        self.screenshot_dir = self.config.get('screenshot_dir', 'screenshots')
+        self.report_dir = self.config.get('report_dir', 'reports')
+        self.timeout = self.config.get('timeout', 30)
+        self.retry_attempts = self.config.get('retry_attempts', 3)
+        
+        # Create directories if they don't exist
+        Path(self.screenshot_dir).mkdir(parents=True, exist_ok=True)
+        Path(self.report_dir).mkdir(parents=True, exist_ok=True)
+        
+        # Set test data
+        self.test_data = self.config.get('test_data', {})
+        
+        logger.info(f"Test configuration loaded from {config_path}")
+    
+    def _load_config(self) -> Dict:
+        """Load configuration from JSON file"""
+        try:
+            with open(self.config_path, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error(f"Error loading config: {str(e)}")
+            logger.warning("Using default configuration")
+            return {
+                'cxone_api_url': 'https://api.nice-incontact.com',
+                'browser': 'chrome',
+                'headless': True,
+                'screenshot_dir': 'screenshots',
+                'report_dir': 'reports',
+                'timeout': 30,
+                'retry_attempts': 3,
+                'test_data': {}
+            }
+    
+    def get_test_data(self, test_name: str) -> Dict:
+        """Get test data for a specific test
+        
+        Args:
+            test_name: Name of the test
+            
+        Returns:
+            Test data dictionary
+        """
+        return self.test_data.get(test_name, {})
+
+
+class CXoneAgentSDKWrapper:
+    """Wrapper for the CXone Agent SDK to simplify integration testing"""
+    
+    def __init__(self, config: CXoneTestConfig):
+        """Initialize the CXone Agent SDK wrapper
+        
+        Args:
+            config: Test configuration
+        """
+        self.config = config
+        self.client = None
+        self.authenticated = False
+    
+    def authenticate(self, username: str, password: str) -> bool:
+        """Authenticate with CXone platform
+        
+        Args:
+            username: Agent username
+            password: Agent password
+            
+        Returns:
+            True if authentication successful, False otherwise
+        """
+        try:
+            self.client = CXoneClient(
+                base_url=self.config.cxone_api_url,
+                username=username,
+                password=password
+            )
+            self.client.authenticate()
+            self.authenticated = True
+            logger.info(f"Successfully authenticated agent: {username}")
+            return True
+        except AuthenticationException as e:
+            logger.error(f"Authentication failed: {str(e)}")
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error during authentication: {str(e)}")
+            return False
+    
+    def set_agent_state(self, state: str) -> bool:
+        """Set the agent state
+        
+        Args:
+            state: Target agent state
+            
+        Returns:
+            True if state change successful, False otherwise
+        """
+        if not self.authenticated or not self.client:
+            logger.error("Cannot set agent state: Not authenticated")
+            return False
+        
+        try:
+            # Map string state to AgentState enum
+            agent_state = AgentState[state.upper()]
+            self.client.set_agent_state(agent_state)
+            logger.info(f"Agent state set to: {state}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to set agent state: {str(e)}")
+            return False
+
+
+class CXoneSeleniumWrapper:
+    """Wrapper for Selenium WebDriver for CXone UI testing"""
+    
+    def __init__(self, config: CXoneTestConfig):
+        """Initialize the Selenium wrapper
+        
+        Args:
+            config: Test configuration
+        """
+        self.config = config
+        self.driver = self._initialize_webdriver()
+        self.wait = WebDriverWait(self.driver, config.timeout)
+    
+    def _initialize_webdriver(self) -> webdriver:
+        """Initialize WebDriver based on configuration
+        
+        Returns:
+            Selenium WebDriver instance
+        """
+        browser = self.config.browser.lower()
+        headless = self.config.headless
+        
+        try:
+            if browser == 'chrome':
+                options = webdriver.ChromeOptions()
+                if headless:
+                    options.add_argument('--headless')
+                options.add_argument('--window-size=1920,1080')
+                options.add_argument('--no-sandbox')
+                options.add_argument('--disable-dev-shm-usage')
+                return webdriver.Chrome(options=options)
+            
+            elif browser == 'firefox':
+                options = webdriver.FirefoxOptions()
+                if headless:
+                    options.add_argument('--headless')
+                options.add_argument('--width=1920')
+                options.add_argument('--height=1080')
+                return webdriver.Firefox(options=options)
+            
+            elif browser == 'edge':
+                options = webdriver.EdgeOptions()
+                if headless:
+                    options.add_argument('--headless')
+                options.add_argument('--window-size=1920,1080')
+                return webdriver.Edge(options=options)
+            
+            else:
+                logger.warning(f"Unsupported browser: {browser}. Defaulting to Chrome.")
+                options = webdriver.ChromeOptions()
+                if headless:
+                    options.add_argument('--headless')
+                options.add_argument('--window-size=1920,1080')
+                return webdriver.Chrome(options=options)
+        
+        except Exception as e:
+            logger.error(f"Failed to initialize WebDriver: {str(e)}")
+            raise
+
+
+class HIPAAComplianceChecker:
+    """Checks HIPAA compliance in CXone healthcare applications"""
+    
+    def __init__(self, config: CXoneTestConfig):
+        """Initialize the HIPAA compliance checker
+        
+        Args:
+            config: Test configuration
+        """
+        self.config = config
+        self.compliance_rules = self._load_compliance_rules()
+        logger.info("HIPAA Compliance Checker initialized")
+    
+    def _load_compliance_rules(self) -> Dict:
+        """Load HIPAA compliance rules
+        
+        Returns:
+            Dictionary of compliance rules
+        """
+        rules_path = self.config.config.get('hipaa_rules_path', 'hipaa_compliance_rules.json')
+        try:
+            with open(rules_path, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error(f"Error loading HIPAA compliance rules: {str(e)}")
+            logger.warning("Using default HIPAA compliance rules")
+            return {
+                'phi_patterns': [
+                    r'\b\d{3}-\d{2}-\d{4}\b',  # SSN
+                    r'\b\d{3}-\d{3}-\d{4}\b',  # Phone number
+                    r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b',  # Email
+                    r'\b\d{1,2}/\d{1,2}/\d{2,4}\b'  # Date
+                ],
+                'required_disclaimers': [
+                    "This communication is intended only for the use of the individual or entity to which it is addressed.",
+                    "HIPAA Notice: This information is confidential and protected under federal law."
+                ],
+                'restricted_terms': [
+                    "HIV",
+                    "AIDS",
+                    "mental health",
+                    "substance abuse",
+                    "genetic testing"
+                ]
+            }
+    
+    def check_text_for_phi(self, text: str) -> List[Dict]:
+        """Check text for potential PHI (Protected Health Information)
+        
+        Args:
+            text: Text to check
+            
+        Returns:
+            List of PHI findings with pattern and matched text
+        """
+        import re
+        findings = []
+        
+        for pattern in self.compliance_rules.get('phi_patterns', []):
+            matches = re.finditer(pattern, text)
+            for match in matches:
+                findings.append({
+                    'pattern': pattern,
+                    'matched_text': match.group(),
+                    'position': match.span()
+                })
+        
+        return findings
+    
+    def check_required_disclaimers(self, text: str) -> List[str]:
+        """Check if required HIPAA disclaimers are present
+        
+        Args:
+            text: Text to check
+            
+        Returns:
+            List of missing disclaimers
+        """
+        missing = []
+        for disclaimer in self.compliance_rules.get('required_disclaimers', []):
+            if disclaimer.lower() not in text.lower():
+                missing.append(disclaimer)
+        
+        return missing
+    
+    def check_restricted_terms(self, text: str) -> List[Dict]:
+        """Check for restricted terms that require special handling
+        
+        Args:
+            text: Text to check
+            
+        Returns:
+            List of found restricted terms with context
+        """
+        import re
+        findings = []
+        
+        for term in self.compliance_rules.get('restricted_terms', []):
+            pattern = r'\b' + re.escape(term) + r'\b'
+            matches = re.finditer(pattern, text, re.IGNORECASE)
+            
+            for match in matches:
+                # Get surrounding context (20 chars before and after)
+                start = max(0, match.start() - 20)
+                end = min(len(text), match.end() + 20)
+                context = text[start:end]
+                
+                findings.append({
+                    'term': term,
+                    'context': context,
+                    'position': match.span()
+                })
+        
+        return findings
+    
+    def validate_transcript(self, transcript: str) -> Dict:
+        """Validate a transcript for HIPAA compliance
+        
+        Args:
+            transcript: Conversation transcript
+            
+        Returns:
+            Dictionary with validation results
+        """
+        results = {
+            'phi_findings': self.check_text_for_phi(transcript),
+            'missing_disclaimers': self.check_required_disclaimers(transcript),
+            'restricted_terms': self.check_restricted_terms(transcript),
+            'compliant': False
+        }
+        
+        # Check if compliant
+        if not results['phi_findings'] and not results['missing_disclaimers']:
+            results['compliant'] = True
+        
+        return results
+    
+    def validate_screen(self, selenium: CXoneSeleniumWrapper) -> Dict:
+        """Validate a UI screen for HIPAA compliance
+        
+        Args:
+            selenium: Selenium wrapper instance
+            
+        Returns:
+            Dictionary with validation results
+        """
+        # Get page source
+        page_source = selenium.driver.page_source
+        
+        # Take screenshot for evidence
+        screenshot_path = selenium.take_screenshot("hipaa_compliance_check")
+        
+        # Validate the text content
+        results = self.validate_transcript(page_source)
+        results['screenshot_path'] = screenshot_path
+        
+        return results
+
+
+class HealthcareAgentTests(CXoneHealthcareTestBase):
+    """Tests for healthcare agent workflows in CXone"""
+    
+    def test_agent_login(self):
+        """Test agent login to CXone platform"""
+        # Get test data
+        username = self.test_data.get('username', 'test_agent')
+        password = self.test_data.get('password', 'test_password')
+        login_url = self.test_data.get('login_url', 'https://home.nice-incontact.com')
+        
+        # Attempt login via SDK
+        sdk_login_success = self.agent_sdk.authenticate(username, password)
+        self.assertTrue(sdk_login_success, "Agent SDK authentication failed")
+        
+        # Attempt login via UI
+        self.selenium.navigate_to(login_url)
+        
+        # Enter username
+        username_success = self.selenium.enter_text('id', 'username', username)
+        self.assertTrue(username_success, "Failed to enter username")
+        
+        # Enter password
+        password_success = self.selenium.enter_text('id', 'password', password)
+        self.assertTrue(password_success, "Failed to enter password")
+        
+        # Click login button
+        login_success = self.selenium.click_element('id', 'login-button')
+        self.assertTrue(login_success, "Failed to click login button")
+        
+        # Verify successful login by checking for agent desktop element
+        agent_desktop_loaded = self.selenium.find_element('id', 'agent-desktop-container', wait_time=30)
+        self.assertIsNotNone(agent_desktop_loaded, "Agent desktop failed to load after login")
+    
+    def test_patient_record_lookup(self):
+        """Test patient record lookup in CXone healthcare integration"""
+        # Skip if not authenticated
+        if not self.agent_sdk.authenticated:
+            self.skipTest("Agent not authenticated")
+        
+        # Get test data
+        patient_mrn = self.test_data.get('patient_mrn', 'MRN12345678')
+        
+        # Navigate to patient lookup screen
+        self.selenium.navigate_to(self.test_data.get('patient_lookup_url', 'https://home.nice-incontact.com/healthcare/patients'))
+        
+        # Enter patient MRN
+        self.selenium.enter_text('id', 'patient-search-input', patient_mrn)
+        
+        # Click search button
+        self.selenium.click_element('id', 'patient-search-button')
+        
+        # Wait for patient record to load
+        patient_loaded = self.selenium.wait_for_text_present('id', 'patient-name', 'Test Patient', wait_time=10)
+        self.assertTrue(patient_loaded, f"Patient record not found for MRN: {patient_mrn}")
+        
+        # Check HIPAA compliance of patient record screen
+        hipaa_checker = HIPAAComplianceChecker(self.config)
+        compliance_results = hipaa_checker.validate_screen(self.selenium)
+        
+        # Verify no PHI is exposed inappropriately
+        self.assertEqual(len(compliance_results['phi_findings']), 0, 
+                         f"PHI exposed on patient record screen: {compliance_results['phi_findings']}")
+        
+        # Verify required disclaimers are present
+        self.assertEqual(len(compliance_results['missing_disclaimers']), 0,
+                         f"Missing HIPAA disclaimers: {compliance_results['missing_disclaimers']}")
+    
+    def test_appointment_scheduling(self):
+        """Test appointment scheduling in CXone healthcare integration"""
+        # Skip if not authenticated
+        if not self.agent_sdk.authenticated:
+            self.skipTest("Agent not authenticated")
+        
+        # Get test data
+        patient_mrn = self.test_data.get('patient_mrn', 'MRN12345678')
+        appointment_date = self.test_data.get('appointment_date', 
+                                           (datetime.datetime.now() + datetime.timedelta(days=7)).strftime('%Y-%m-%d'))
+        appointment_time = self.test_data.get('appointment_time', '10:00 AM')
+        appointment_type = self.test_data.get('appointment_type', 'Follow-up')
+        appointment_provider = self.test_data.get('appointment_provider', 'Dr. Smith')
+        
+        # Navigate to appointment scheduling screen
+        self.selenium.navigate_to(self.test_data.get('appointment_url', 'https://home.nice-incontact.com/healthcare/appointments'))
+        
+        # Enter patient MRN
+        self.selenium.enter_text('id', 'appointment-patient-mrn', patient_mrn)
+        
+        # Enter appointment details
+        self.selenium.enter_text('id', 'appointment-date', appointment_date)
+        self.selenium.enter_text('id', 'appointment-time', appointment_time)
+        
+        # Select appointment type
+        self.selenium.click_element('id', 'appointment-type-dropdown')
+        self.selenium.click_element('xpath', f"//li[text()='{appointment_type}']")
+        
+        # Select provider
+        self.selenium.click_element('id', 'appointment-provider-dropdown')
+        self.selenium.click_element('xpath', f"//li[text()='{appointment_provider}']")
+        
+        # Submit appointment
+        self.selenium.click_element('id', 'appointment-submit-button')
+        
+        # Verify appointment confirmation
+        confirmation = self.selenium.wait_for_text_present('id', 'appointment-confirmation', 
+                                                       'Appointment scheduled successfully', wait_time=10)
+        self.assertTrue(confirmation, "Appointment scheduling failed")
+        
+        # Get confirmation number
+        confirmation_number = self.selenium.get_text('id', 'appointment-confirmation-number')
+        self.assertIsNotNone(confirmation_number, "Appointment confirmation number not found")
+        
+        logger.info(f"Appointment scheduled with confirmation number: {confirmation_number}")
+    
+    def test_inbound_voice_handling(self):
+        """Test handling of inbound voice contact from healthcare patient"""
+        # Skip if not authenticated
+        if not self.agent_sdk.authenticated:
+            self.skipTest("Agent not authenticated")
+        
+        # Get test data
+        skill_id = self.test_data.get('voice_skill_id', '12345')
+        patient_mrn = self.test_data.get('patient_mrn', 'MRN12345678')
+        
+        # Set agent to available state
+        self.agent_sdk.set_agent_state('AVAILABLE')
+        
+        # Simulate inbound healthcare voice contact
+        contact_id = self.simulator.simulate_healthcare_patient_contact(
+            skill_id=skill_id,
+            contact_type='voice',
+            patient_mrn=patient_mrn
+        )
+        
+        self.assertIsNotNone(contact_id, "Failed to simulate voice contact")
+        
+        # Wait for contact to appear in agent desktop
+        max_wait = 30  # seconds
+        start_time = time.time()
+        contact_received = False
+        
+        while time.time() - start_time < max_wait and not contact_received:
+            # Check for active contacts
+            active_contacts = self.agent_sdk.get_active_contacts()
+            
+            if any(contact.id == contact_id for contact in active_contacts):
+                contact_received = True
+                break
+            
+            time.sleep(1)
+        
+        self.assertTrue(contact_received, f"Contact not received within {max_wait} seconds")
+        
+        # Verify contact is displaying in UI
+        contact_visible = self.selenium.wait_for_text_present('class', 'contact-card', contact_id, wait_time=10)
+        self.assertTrue(contact_visible, "Contact not visible in agent desktop")
+        
+        # Accept the contact
+        self.agent_sdk.accept_contact(contact_id)
+        
+        # Verify patient information is loaded
+        patient_info_loaded = self.selenium.wait_for_text_present('id', 'patient-info-card', patient_mrn, wait_time=10)
+        self.assertTrue(patient_info_loaded, "Patient information not loaded with contact")
+        
+        # Verify HIPAA compliance
+        hipaa_checker = HIPAAComplianceChecker(self.config)
+        compliance_results = hipaa_checker.validate_screen(self.selenium)
+        
+        self.assertEqual(len(compliance_results['phi_findings']), 0, 
+                        f"PHI exposed inappropriately during voice contact: {compliance_results['phi_findings']}")
+        
+        # End the contact
+        self.agent_sdk.end_contact(contact_id)
+        
+        # Verify disposition screen
+        disposition_visible = self.selenium.wait_for_text_present('id', 'disposition-form', 'Disposition', wait_time=10)
+        self.assertTrue(disposition_visible, "Disposition form not shown after ending contact")
+        
+        # Apply disposition
+        self.selenium.click_element('xpath', "//label[text()='Information provided']")
+        self.selenium.click_element('id', 'disposition-submit-button')
+        
+        # Verify agent returned to available state
+        time.sleep(5)  # Wait for state to update
+        agent_state = self.selenium.get_text('id', 'agent-state-indicator')
+        self.assertEqual(agent_state, "Available", "Agent did not return to Available state after contact")
+
+
+def main():
+    """Main entry point for the CXone Healthcare Testing Framework"""
+    parser = argparse.ArgumentParser(description='CXone Healthcare Testing Framework')
+    parser.add_argument('--config', type=str, default='test_config.json', help='Path to test configuration file')
+    parser.add_argument('--test-pattern', type=str, default='test_*', help='Pattern for test methods to run')
+    parser.add_argument('--headless', action='store_true', help='Run tests in headless mode')
+    
+    args = parser.parse_args()
+    
+    # Set environment variables based on arguments
+    os.environ['CXONE_TEST_CONFIG'] = args.config
+    if args.headless:
+        os.environ['CXONE_TEST_HEADLESS'] = 'true'
+    
+    # Discover and run tests
+    test_suite = unittest.defaultTestLoader.loadTestsFromName('HealthcareAgentTests')
+    unittest.TextTestRunner(verbosity=2).run(test_suite)
+
+
+if __name__ == "__main__":
+    main()
